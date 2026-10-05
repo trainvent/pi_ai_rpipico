@@ -2,6 +2,13 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Pico Speaker Test (USB)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "bash scripts/run-usb.sh --test-tone",
+      "cwd": "${workspaceFolder}"
+    },
+    {
       "name": "Pico Run (USB — no probe)",
       "type": "node-terminal",
       "request": "launch",
