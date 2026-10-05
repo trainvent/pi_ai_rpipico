@@ -5,15 +5,17 @@ name = "pi_ai_rpipico"
 version = "0.1.0"
 license = "MIT or Apache-2.0"
 
-[build-dependencies]
-regex = "1.11.0"
-
 [dependencies]
 cortex-m = "0.7"
 cortex-m-rt = "0.7"
 embedded-hal = "1.0.0"
 defmt = "1"
-defmt-rtt = "1"
+defmt-rtt = { version = "1", features = ["disable-blocking-mode"] }
+pio = "0.2.1"
+
+[features]
+default = []
+test-tone = []
 
 [target.'cfg( target_arch = "arm" )'.dependencies]
 panic-probe = { version = "1", features = ["print-defmt"] }

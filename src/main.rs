@@ -1,78 +1,24 @@
-//! SPDX-License-Identifier: MIT OR Apache-2.0
-//!
-//! Copyright (c) 2021–2024 The rp-rs Developers
-//! Copyright (c) 2021 rp-rs organization
-//! Copyright (c) 2025 Raspberry Pi Ltd.
-//!
-//! # GPIO 'Blinky' Example
-//!
-//! This application demonstrates how to control a GPIO pin on the rp2040 and rp235x.
-//!
-//! It may need to be adapted to your particular board layout and/or pin assignment.
-
 #![no_std]
 #![no_main]
 
-use defmt::*;
 use defmt_rtt as _;
-use embedded_hal::delay::DelayNs;
-use embedded_hal::digital::OutputPin;
-#[cfg(target_arch = "riscv32")]
-use panic_halt as _;
-#[cfg(target_arch = "arm")]
 use panic_probe as _;
+use pi_ai_rpipico::{
+    BLOCK_FRAMES, BLOCK_WORDS, CaptureStats, PIO_CYCLES_PER_FRAME, SAMPLE_RATE, TestTone,
+    i2s_program, microphone_pcm16, speaker_slot,
+};
+use rp235x_hal::{self as hal, clocks::Clock, dma::DMAExt, pio::PIOExt};
 
-// Alias for our HAL crate
-use hal::entry;
-
-#[cfg(rp2350)]
-use rp235x_hal as hal;
-
-#[cfg(rp2040)]
-use rp2040_hal as hal;
-
-// use bsp::entry;
-// use bsp::hal;
-// use rp_pico as bsp;
-
-/// The linker will place this boot block at the start of our program image. We
-/// need this to help the ROM bootloader get our code up and running.
-/// Note: This boot block is not necessary when using a rp-hal based BSP
-/// as the BSPs already perform this step.
-#[unsafe(link_section = ".boot2")]
-#[used]
-#[cfg(rp2040)]
-pub static BOOT2: [u8; 256] = rp2040_boot2::BOOT_LOADER_W25Q080;
-
-/// Tell the Boot ROM about our application
 #[unsafe(link_section = ".start_block")]
 #[used]
-#[cfg(rp2350)]
 pub static IMAGE_DEF: hal::block::ImageDef = hal::block::ImageDef::secure_exe();
 
-/// External high-speed crystal on the Raspberry Pi Pico 2 board is 12 MHz.
-/// Adjust if your board has a different frequency
-const XTAL_FREQ_HZ: u32 = 12_000_000u32;
-
-/// Entry point to our bare-metal application.
-///
-/// The `#[hal::entry]` macro ensures the Cortex-M start-up code calls this function
-/// as soon as all global variables and the spinlock are initialised.
-///
-/// The function configures the rp2040 and rp235x peripherals, then toggles a GPIO pin in
-/// an infinite loop. If there is an LED connected to that pin, it will blink.
-#[entry]
+#[hal::entry]
 fn main() -> ! {
-    info!("Program start");
-    // Grab our singleton objects
     let mut pac = hal::pac::Peripherals::take().unwrap();
-
-    // Set up the watchdog driver - needed by the clock setup code
     let mut watchdog = hal::Watchdog::new(pac.WATCHDOG);
-
-    // Configure the clocks
     let clocks = hal::clocks::init_clocks_and_plls(
-        XTAL_FREQ_HZ,
+        12_000_000,
         pac.XOSC,
         pac.CLOCKS,
         pac.PLL_SYS,
@@ -81,45 +27,128 @@ fn main() -> ! {
         &mut watchdog,
     )
     .unwrap();
-
-    #[cfg(rp2040)]
-    let mut timer = hal::Timer::new(pac.TIMER, &mut pac.RESETS, &clocks);
-
-    #[cfg(rp2350)]
-    let mut timer = hal::Timer::new_timer0(pac.TIMER0, &mut pac.RESETS, &clocks);
-
-    // The single-cycle I/O block controls our GPIO pins
     let sio = hal::Sio::new(pac.SIO);
-
-    // Set the pins to their default state
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
         pac.PADS_BANK0,
         sio.gpio_bank0,
         &mut pac.RESETS,
     );
+    let _bclk = pins.gpio10.into_function::<hal::gpio::FunctionPio0>();
+    let _lrclk = pins.gpio11.into_function::<hal::gpio::FunctionPio0>();
+    let _mic = pins
+        .gpio12
+        .into_pull_down_input()
+        .into_function::<hal::gpio::FunctionPio0>();
+    let _speaker = pins.gpio13.into_function::<hal::gpio::FunctionPio0>();
+    let (mut pio, sm0, _, _, _) = pac.PIO0.split(&mut pac.RESETS);
+    let installed = pio.install(&i2s_program()).unwrap();
+    let divider = ((clocks.system_clock.freq().to_Hz() as u64 * 256)
+        / (SAMPLE_RATE * PIO_CYCLES_PER_FRAME) as u64) as u32;
+    let (mut sm, rx, tx) = hal::pio::PIOBuilder::from_installed_program(installed)
+        .side_set_pin_base(10)
+        .out_pins(13, 1)
+        .in_pin_base(12)
+        .out_shift_direction(hal::pio::ShiftDirection::Left)
+        .in_shift_direction(hal::pio::ShiftDirection::Left)
+        .autopull(true)
+        .pull_threshold(32)
+        .autopush(true)
+        .push_threshold(32)
+        .clock_divisor_fixed_point((divider >> 8) as u16, divider as u8)
+        .build(sm0);
+    sm.set_pins([
+        (10, hal::pio::PinState::Low),
+        (11, hal::pio::PinState::Low),
+        (13, hal::pio::PinState::Low),
+    ]);
+    sm.set_pindirs([
+        (10, hal::pio::PinDir::Output),
+        (11, hal::pio::PinDir::Output),
+        (12, hal::pio::PinDir::Input),
+        (13, hal::pio::PinDir::Output),
+    ]);
 
-    // Configure GPIO25 as an output
-    let mut led_pin = pins.gpio25.into_push_pull_output();
+    let tx_a = cortex_m::singleton!(: [u32; BLOCK_WORDS] = [0; BLOCK_WORDS]).unwrap();
+    let tx_b = cortex_m::singleton!(: [u32; BLOCK_WORDS] = [0; BLOCK_WORDS]).unwrap();
+    let rx_a = cortex_m::singleton!(: [u32; BLOCK_WORDS] = [0; BLOCK_WORDS]).unwrap();
+    let rx_b = cortex_m::singleton!(: [u32; BLOCK_WORDS] = [0; BLOCK_WORDS]).unwrap();
+    let mut tone = TestTone::default();
+    fill_output(tx_a, &mut tone, 0);
+    fill_output(tx_b, &mut tone, BLOCK_FRAMES as u32);
+    let dma = pac.DMA.split(&mut pac.RESETS);
+    let mut output = hal::dma::double_buffer::Config::new((dma.ch0, dma.ch1), tx_a, tx)
+        .start()
+        .read_next(tx_b);
+    let mut input = hal::dma::double_buffer::Config::new((dma.ch2, dma.ch3), rx, rx_a)
+        .start()
+        .write_next(rx_b);
+    defmt::info!(
+        "I2S diagnostic: 48kHz, GP10/11 clocks, GP12 mic, GP13 speaker; tone={}",
+        cfg!(feature = "test-tone")
+    );
+    let _running = sm.start();
+    let mut stats = CaptureStats::default();
+    let mut frames = 0u32;
+    let mut stall_windows = 0u32;
     loop {
-        info!("on!");
-        led_pin.set_high().unwrap();
-        timer.delay_ms(200);
-        info!("off!");
-        led_pin.set_low().unwrap();
-        timer.delay_ms(200);
+        let (out_buf, next_output) = output.wait();
+        fill_output(
+            out_buf,
+            &mut tone,
+            frames.wrapping_add(2 * BLOCK_FRAMES as u32),
+        );
+        output = next_output.read_next(out_buf);
+        let (in_buf, next_input) = input.wait();
+        // Ignore the first 100ms for microphone startup and initial frame alignment.
+        if frames >= SAMPLE_RATE / 10 {
+            for pair in in_buf.chunks_exact(2) {
+                stats.add(microphone_pcm16(pair[0]));
+            }
+        }
+        input = next_input.write_next(in_buf);
+        frames = frames.wrapping_add(BLOCK_FRAMES as u32);
+        // HAL owns the PIO block. Only read/W1C the independent SM0 debug
+        // flags here; no configuration or FIFO registers are accessed.
+        let debug = unsafe { &*hal::pac::PIO0::ptr() }.fdebug();
+        let flags = debug.read();
+        if flags.rxstall().bits() & 1 != 0 || flags.txstall().bits() & 1 != 0 {
+            stall_windows = stall_windows.saturating_add(1);
+            debug.write(|w| unsafe { w.rxstall().bits(1).txstall().bits(1) });
+        }
+        if stats.samples >= SAMPLE_RATE {
+            defmt::info!(
+                "capture PCM16: peak={} rms={} clipped={} samples={} stall_windows={}",
+                stats.peak,
+                stats.rms(),
+                stats.clipped,
+                stats.samples,
+                stall_windows
+            );
+            stats = CaptureStats::default();
+            stall_windows = 0;
+        }
     }
 }
 
-/// Program metadata for `picotool info`
+fn fill_output(buf: &mut [u32; BLOCK_WORDS], tone: &mut TestTone, start: u32) {
+    for (i, pair) in buf.chunks_exact_mut(2).enumerate() {
+        // A one-second quiet tone every five seconds, only in the opt-in build.
+        let sample = if cfg!(feature = "test-tone")
+            && start.wrapping_add(i as u32) % (SAMPLE_RATE * 5) < SAMPLE_RATE
+        {
+            tone.next_sample()
+        } else {
+            0
+        };
+        pair.fill(speaker_slot(sample));
+    }
+}
+
 #[unsafe(link_section = ".bi_entries")]
 #[used]
-pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 5] = [
+pub static PICOTOOL_ENTRIES: [hal::binary_info::EntryAddr; 3] = [
     hal::binary_info::rp_cargo_bin_name!(),
     hal::binary_info::rp_cargo_version!(),
-    hal::binary_info::rp_program_description!(c"Blinky Example"),
-    hal::binary_info::rp_cargo_homepage_url!(),
-    hal::binary_info::rp_program_build_attribute!(),
+    hal::binary_info::rp_program_description!(c"Pico 2 W I2S audio diagnostic"),
 ];
-
-// End of file
