@@ -1,5 +1,8 @@
 # Pico 2 W Rust voice assistant
 
+> [!CAUTION]
+> i gave up the project because the Raspberry Pi Pico 2 W is too weak. now i am working on an esp32-s3 soution https://github.com/trainvent/ESPal
+
 This repository currently implements the **audio hardware diagnostic milestone**.
 It is not yet a networked voice assistant: Wi-Fi, audio transport, OpenAI sessions,
 manual conversation activation, timeout and playback echo suppression remain to be implemented.
